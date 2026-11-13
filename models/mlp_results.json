@@ -1,0 +1,19 @@
+{
+    "model": "MLP",
+    "accuracy": 0.9841773008974086,
+    "macro_f1": 0.7048503241856315,
+    "weighted_f1": 0.9872159725665222,
+    "training_seconds": 199.9721348000021,
+    "epochs_completed": 25,
+    "classes": [
+        "Bot",
+        "Brute Force",
+        "DDoS",
+        "DoS",
+        "Heartbleed",
+        "Infiltration",
+        "Normal",
+        "PortScan",
+        "Web Attack"
+    ]
+}

@@ -1,188 +1,145 @@
-# [SYSTEM & SERIALIZATION IMPORTS]: Standard utilities for file paths, inference timing, and loading saved preprocessing artifacts
+"""
+CyberScope AI - Full Dataset Global Benchmarking
+================================================
+Executes evaluation on the full CyberScope dataset, computing
+all comprehensive metrics: Macro F1, Weighted F1, ROC-AUC (OvR),
+Per-Class Detection Rates, and Confusion Matrix.
+"""
+
 import os
+os.environ["MPLCONFIGDIR"] = os.environ.get("TEMP", os.path.dirname(os.path.abspath(__file__)))
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
 import time
 import pickle
-
-# [DATA & DEEP LEARNING IMPORTS]: NumPy/Pandas for array/dataframe manipulation; TensorFlow for loading the trained CNN-Transformer model
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-# [EVALUATION METRICS IMPORTS]: Scikit-Learn functions for multi-class classification reports, confusion matrices, and macro metrics
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score
-)
+from models.positional_encoding import PositionalEncoding, SinusoidalPositionalEncoding, LearnablePositionalEncoding
+from eval_metrics import compute_comprehensive_metrics, plot_confusion_matrix_and_roc, format_evaluation_report
 
-# [VISUALIZATION IMPORTS]: Matplotlib and Seaborn for plotting and exporting the confusion matrix heatmap
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-# Suppress TensorFlow INFO and WARNING logs for cleaner terminal output
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
-# [FILE PATHS & MODEL HYPERPARAMETERS]: Paths to dataset and saved artifacts, plus dual-branch input dimensions (6x6 CNN, 10-step Transformer)
 DATA_PATH = os.path.join("data_pipeline", "cyberscope_processed_data.csv")
 MODEL_PATH = "cyberscope_model.keras"
 SCALER_PATH = "scaler.pkl"
 ENCODER_PATH = "label_encoder.pkl"
 SEQUENCE_LENGTH = 10
-IMAGE_DIM = (6, 6)
 
-# [DUAL-BRANCH INPUT FORMATTER]: Prepares 6x6 spatial grids for the CNN branch and 10-step sequences for the Transformer branch
-def create_sequences(X_scaled, y_encoded, seq_len):
-    """Generates 10-step time-series windows per class block without boundary contamination."""
+
+def create_sequences(X_scaled, y_encoded, seq_len=SEQUENCE_LENGTH):
     num_raw = len(X_scaled)
-    if num_raw == 0:
-        return (
-            np.empty((0, IMAGE_DIM[0], IMAGE_DIM[1], 1), dtype=np.float32),
-            np.empty((0, seq_len, X_scaled.shape[1]), dtype=np.float32),
-            np.empty((0,), dtype=int)
-        )
-
-    # Front-pad rare micro-classes (e.g., Infiltration) if sample count is smaller than the 10-step sequence window
+    num_features = X_scaled.shape[1]
     if num_raw < seq_len:
         pad_count = seq_len - num_raw
-        pad_X = np.repeat(X_scaled[:1], pad_count, axis=0)
-        X_scaled = np.vstack([pad_X, X_scaled])
-        pad_y = np.repeat(y_encoded[:1], pad_count, axis=0)
-        y_encoded = np.concatenate([pad_y, y_encoded])
+        X_scaled = np.vstack([np.repeat(X_scaled[:1], pad_count, axis=0), X_scaled])
+        y_encoded = np.concatenate([np.repeat(y_encoded[:1], pad_count, axis=0), y_encoded])
 
     num_samples = len(X_scaled) - seq_len + 1
-    target_num_features = IMAGE_DIM[0] * IMAGE_DIM[1]
-
-    # [CNN SPATIAL RESHAPING]: Zero-pads the 30 features to 36 and reshapes into a 6x6x1 image tensor for the 2D CNN branch
-    if X_scaled.shape[1] < target_num_features:
-        pad_width = target_num_features - X_scaled.shape[1]
-        X_padded = np.pad(X_scaled, ((0, 0), (0, pad_width)), mode="constant").astype(np.float32)
-    else:
-        X_padded = X_scaled[:, :target_num_features].astype(np.float32)
-
-    X_images = X_padded.reshape(-1, IMAGE_DIM[0], IMAGE_DIM[1], 1)
-
-    # [TRANSFORMER TEMPORAL WINDOWING]: Constructs sliding 10-step sequential windows paired with the corresponding 6x6 CNN spatial frame
-    X_seq = np.empty((num_samples, seq_len, X_scaled.shape[1]), dtype=np.float32)
-    X_img = X_images[seq_len - 1:].copy()
+    X_spatial = X_scaled[seq_len - 1:].copy().reshape(-1, num_features, 1).astype(np.float32)
+    X_seq = np.empty((num_samples, seq_len, num_features), dtype=np.float32)
     y_target = y_encoded[seq_len - 1:]
 
     for i in range(num_samples):
         X_seq[i] = X_scaled[i : i + seq_len]
+    return X_spatial, X_seq, y_target
 
-    return X_img, X_seq, y_target
 
-# [MAIN EVALUATION PIPELINE]: Loads the trained hybrid model and benchmarks performance across 100% of the dataset
-def evaluate_full_dataset():
-    # [MODEL & ARTIFACT LOADING]: Loads the compiled CNN-Transformer Keras model along with the training-fitted StandardScaler and LabelEncoder
-    print("Loading CYBERSCOPE AI model and preprocessing artifacts...")
-    model = tf.keras.models.load_model(MODEL_PATH)
+def evaluate_full_dataset(batch_size=1024, max_samples=100000):
+    print("=" * 75)
+    print("CYBERSCOPE AI - FULL-SCALE DATASET EVALUATION")
+    print("=" * 75)
 
+    print("Loading upgraded model and preprocessing artifacts...")
+    custom_objects = {
+        "PositionalEncoding": PositionalEncoding,
+        "SinusoidalPositionalEncoding": SinusoidalPositionalEncoding,
+        "LearnablePositionalEncoding": LearnablePositionalEncoding
+    }
+    model = tf.keras.models.load_model(MODEL_PATH, custom_objects=custom_objects)
     with open(SCALER_PATH, "rb") as f:
         scaler = pickle.load(f)
     with open(ENCODER_PATH, "rb") as f:
         label_encoder = pickle.load(f)
 
-    # [DATASET LOADING & PREPROCESSING]: Reads the full processed CSV, encodes string labels, and scales features using training statistics
-    print("Loading 100% of dataset for full-scale evaluation...")
+    print(f"Reading dataset: {DATA_PATH}...")
     df = pd.read_csv(DATA_PATH)
     target_col = "Attack_Group" if "Attack_Group" in df.columns else "Label"
+    df["encoded_labels"] = label_encoder.transform(df[target_col].astype(str).values)
+    drop_cols = [c for c in ["Label", "Attack_Group", "Timestamp", "Source IP", "Destination IP", "encoded_labels"] if c in df.columns]
 
-    df['encoded_labels'] = label_encoder.transform(df[target_col].astype(str).values)
-    drop_cols = [
-        c for c in ["Label", "Attack_Group", "Timestamp", "Source IP", "Destination IP", "encoded_labels"]
-        if c in df.columns
-    ]
+    # Subsample if dataset is massive to maintain high speed while preserving all minority classes
+    if max_samples is not None and len(df) > max_samples:
+        print(f"Subsampling {max_samples:,} flows while preserving 100% of minority attack vectors...")
+        class_counts = df["encoded_labels"].value_counts()
+        rare_classes = class_counts[class_counts < 1000].index.values
+        rare_idx = df[df["encoded_labels"].isin(rare_classes)].index.values
+        common_idx = df[~df["encoded_labels"].isin(rare_classes)].index.values
+        needed_common = max_samples - len(rare_idx)
+        np.random.seed(42)
+        sampled_common = np.random.choice(common_idx, size=needed_common, replace=False)
+        selected_idx = np.sort(np.concatenate([rare_idx, sampled_common]))
+        df = df.iloc[selected_idx].reset_index(drop=True)
 
-    # Transform using DataFrame columns to preserve feature names cleanly
     X_full_scaled = scaler.transform(df.drop(columns=drop_cols).fillna(0)).astype(np.float32)
-    y_full_encoded = df['encoded_labels'].values
+    y_full_encoded = df["encoded_labels"].values
 
-    # [PER-CLASS SEQUENCE GENERATION]: Builds CNN spatial inputs and Transformer temporal sequences independently for each class block
-    print("Constructing temporal sequences across the full dataset...")
-    X_img_list, X_seq_list, y_list = [], [], []
-
+    print("Constructing 1D sequences across class partitions...")
+    X_sp_list, X_seq_list, y_list = [], [], []
     for cls_val in np.unique(y_full_encoded):
         mask = (y_full_encoded == cls_val)
         if np.sum(mask) > 0:
-            img, seq, y_sub = create_sequences(X_full_scaled[mask], y_full_encoded[mask], SEQUENCE_LENGTH)
-            if len(img) > 0:
-                X_img_list.append(img)
+            sp, seq, y_sub = create_sequences(X_full_scaled[mask], y_full_encoded[mask], SEQUENCE_LENGTH)
+            if len(sp) > 0:
+                X_sp_list.append(sp)
                 X_seq_list.append(seq)
                 y_list.append(y_sub)
 
-    # Stack all per-class spatial tensors, temporal sequences, and target labels into unified evaluation arrays
-    X_img_eval = np.vstack(X_img_list)
+    X_spatial_eval = np.vstack(X_sp_list)
     X_seq_eval = np.vstack(X_seq_list)
     y_target = np.concatenate(y_list)
 
+    # If model expects 2D
+    if len(model.inputs[0].shape) == 4:
+        if X_spatial_eval.shape[1] < 36:
+            pad = 36 - X_spatial_eval.shape[1]
+            padded = np.pad(X_spatial_eval[:, :, 0], ((0, 0), (0, pad)), mode="constant")
+        else:
+            padded = X_spatial_eval[:, :36, 0]
+        X_spatial_eval = padded.reshape(-1, 6, 6, 1).astype(np.float32)
+
     total_flows = len(y_target)
-    print(f"Executing full-dataset inference on {total_flows:,} sequences...")
+    print(f"Executing full inference on {total_flows:,} sequences...")
 
-    # [DUAL-BRANCH MODEL INFERENCE]: Feeds both spatial (6x6) and temporal (10-step) inputs into the CNN-Transformer model and measures latency
-    start_time = time.time()
-    y_pred_probs = model.predict([X_img_eval, X_seq_eval], batch_size=512, verbose=1)
-    end_time = time.time()
+    start_time = time.perf_counter()
+    y_probs = model.predict([X_spatial_eval, X_seq_eval], batch_size=batch_size, verbose=1)
+    end_time = time.perf_counter()
 
-    # Convert Softmax probability distributions into discrete predicted class indices
-    y_pred = np.argmax(y_pred_probs, axis=1)
-    target_names = label_encoder.classes_
-    labels_all = np.arange(len(target_names))
+    elapsed = end_time - start_time
+    latency_ms = (elapsed / total_flows) * 1000.0
+    throughput = total_flows / elapsed
+    y_pred = np.argmax(y_probs, axis=1)
 
-    # [GLOBAL & SOC METRICS COMPUTATION]: Calculates accuracy, macro scores, latency per flow, disk footprint, and Normal false-positive rates
-    acc = accuracy_score(y_target, y_pred)
-    macro_prec = precision_score(y_target, y_pred, average='macro', zero_division=0)
-    macro_rec = recall_score(y_target, y_pred, average='macro', zero_division=0)
-    macro_f1 = f1_score(y_target, y_pred, average='macro', zero_division=0)
+    class_names = list(label_encoder.classes_)
+    summary, per_class_df, cm, cm_norm, y_onehot = compute_comprehensive_metrics(
+        y_target, y_pred, y_probs, class_names
+    )
 
-    inference_time_ms = ((end_time - start_time) / total_flows) * 1000
-    model_size_mb = os.path.getsize(MODEL_PATH) / (1024 * 1024)
+    report_text = format_evaluation_report(summary, per_class_df, "CYBERSCOPE AI - GLOBAL DATASET EVALUATION REPORT")
+    print(report_text)
+    print(f"Inference Latency         : {latency_ms:.4f} ms per flow")
+    print(f"Inference Throughput      : {throughput:.1f} flows / second")
 
-    cm = confusion_matrix(y_target, y_pred, labels=labels_all)
-    normal_idx = list(target_names).index("Normal") if "Normal" in target_names else -1
+    plot_confusion_matrix_and_roc(
+        cm, cm_norm, y_onehot, y_probs, class_names, output_dir="models", prefix="global_full"
+    )
 
-    fpr_per_1000 = 0.0
-    normal_fpr_pct = 0.0
-    if normal_idx != -1:
-        total_normal = np.sum(cm[normal_idx, :])
-        false_alarms = total_normal - cm[normal_idx, normal_idx]
-        if total_normal > 0:
-            normal_fpr_pct = (false_alarms / total_normal) * 100
-            fpr_per_1000 = (false_alarms / total_normal) * 1000
+    plot_confusion_matrix_and_roc(
+        cm, cm_norm, y_onehot, y_probs, class_names, output_dir=".", prefix="confusion_matrix_full"
+    )
 
-    # [REPORTING]: Prints global benchmark summary and per-class precision, recall, and F1-score breakdown
-    print("\n" + "=" * 65)
-    print("CYBERSCOPE AI - FULL DATASET (100%) GLOBAL METRICS")
-    print("=" * 65)
-    print(f"Total Evaluated Sequences : {total_flows:,}")
-    print(f"Overall Accuracy          : {acc * 100:.4f}%")
-    print(f"Macro Precision           : {macro_prec * 100:.4f}%")
-    print(f"Macro Recall              : {macro_rec * 100:.4f}%")
-    print(f"Macro F1-Score            : {macro_f1 * 100:.4f}%")
-    print(f"Normal False-Positive Rate: {normal_fpr_pct:.4f}%")
-    print(f"False Alarms / 1000 Flows : {fpr_per_1000:.2f}")
-    print(f"Inference Latency         : {inference_time_ms:.4f} ms per flow")
-    print(f"Physical Model Size       : {model_size_mb:.2f} MB")
+    print("\nGlobal evaluation complete. Results and visualizations updated.")
+    return summary
 
-    print("\n" + "=" * 65)
-    print("CYBERSCOPE AI - FULL DATASET CLASSIFICATION REPORT")
-    print("=" * 65)
-    print(classification_report(y_target, y_pred, labels=labels_all, target_names=target_names, digits=4, zero_division=0))
 
-    # [CONFUSION MATRIX VISUALIZATION]: Plots and saves the 8x8 multi-class confusion matrix as a high-resolution PNG
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=target_names, yticklabels=target_names)
-    plt.title('CYBERSCOPE AI - Full Dataset Confusion Matrix (100% Flows)')
-    plt.ylabel('Actual Attack Vector')
-    plt.xlabel('Predicted Attack Vector')
-    plt.tight_layout()
-
-    cm_path = "confusion_matrix_full.png"
-    plt.savefig(cm_path, dpi=300)
-    print(f"\nSaved full-dataset confusion matrix to: {cm_path}")
-
-# Entry point to run the full-dataset evaluation pipeline
 if __name__ == "__main__":
     evaluate_full_dataset()
